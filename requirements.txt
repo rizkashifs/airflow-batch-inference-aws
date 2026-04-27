@@ -1,0 +1,10 @@
+# Python dependencies for MWAA deployment.
+#
+# MWAA 2.8.x pre-installs:
+#   apache-airflow-providers-amazon  (SageMakerTransformOperator, S3KeySensor)
+#   boto3
+#   pandas
+#
+# Only packages NOT bundled with MWAA 2.8.x need to appear here.
+
+psycopg2-binary>=2.9.9
