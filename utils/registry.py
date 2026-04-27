@@ -8,7 +8,6 @@ resolves the metadata needed to run a Batch Transform job against a
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError

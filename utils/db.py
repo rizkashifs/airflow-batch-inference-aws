@@ -1,8 +1,8 @@
 """PostgreSQL (RDS) loader for batch inference results.
 
-Uses AWS Secrets Manager for credentials, psycopg2 for the connection, and
-execute_values for efficient bulk inserts with ON CONFLICT DO NOTHING
-idempotency (safe to re-run for the same job_name).
+Uses AWS Secrets Manager for credentials and psycopg2 ``execute_values`` for
+efficient bulk inserts.  Inserts are idempotent: re-running the DAG for the
+same job_name skips rows that already exist (ON CONFLICT DO NOTHING).
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from typing import Generator
 
 import boto3
 import pandas as pd
@@ -21,9 +20,10 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# DDL — created at runtime only if the table is absent.
-# For production MWAA, prefer creating this table via IaC (Terraform /
-# CloudFormation) and granting INSERT/SELECT to the pipeline user only.
+# DDL
+# For production MWAA, create this table via IaC (Terraform / CloudFormation)
+# and grant only INSERT + SELECT to the pipeline user.  The runtime CREATE IF
+# NOT EXISTS below is a convenience for first-run bootstrapping.
 # ---------------------------------------------------------------------------
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS {table} (
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     loaded_at       TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_{safe_table}_job_row UNIQUE (job_name, row_index)
 );
-CREATE INDEX IF NOT EXISTS idx_{safe_table}_job ON {table} (job_name);
+CREATE INDEX IF NOT EXISTS idx_{safe_table}_job       ON {table} (job_name);
 CREATE INDEX IF NOT EXISTS idx_{safe_table}_exec_date ON {table} (execution_date);
 """
 
@@ -57,44 +57,48 @@ ON CONFLICT (job_name, row_index) DO NOTHING;
 # ---------------------------------------------------------------------------
 
 def fetch_db_secret(secret_arn: str, region: str) -> dict:
-    """Retrieve RDS credentials from AWS Secrets Manager.
+    """Retrieve RDS connection credentials from AWS Secrets Manager.
 
-    Expected secret format (JSON string):
+    Expected secret format (JSON):
         { "host": "…", "port": 5432, "dbname": "…",
           "username": "…", "password": "…" }
 
-    Returns a dict suitable as **kwargs for psycopg2.connect().
+    Returns a dict ready to be unpacked as ``**kwargs`` into ``psycopg2.connect()``.
     """
     sm = boto3.client("secretsmanager", region_name=region)
     try:
         resp = sm.get_secret_value(SecretId=secret_arn)
     except ClientError as exc:
-        code = exc.response["Error"]["Code"]
-        logger.error("Secrets Manager error (%s) fetching '%s': %s", code, secret_arn, exc)
+        logger.error(
+            "Secrets Manager error (%s) for '%s': %s",
+            exc.response["Error"]["Code"], secret_arn, exc,
+        )
         raise
 
     raw = resp.get("SecretString")
     if not raw:
-        raise RuntimeError(f"Secret '{secret_arn}' has no SecretString (binary secrets not supported).")
+        raise RuntimeError(
+            f"Secret '{secret_arn}' contains no SecretString. "
+            "Binary secrets are not supported."
+        )
 
     try:
         secret = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Secret '{secret_arn}' is not valid JSON.") from exc
 
-    required = {"host", "username", "password", "dbname"}
-    missing = required - set(secret.keys())
+    missing = {"host", "username", "password", "dbname"} - set(secret)
     if missing:
         raise KeyError(
-            f"Secret '{secret_arn}' is missing required key(s): {missing}. "
-            f"Present keys: {set(secret.keys())}."
+            f"Secret '{secret_arn}' is missing key(s): {missing}. "
+            f"Found: {set(secret)}."
         )
 
     return {
-        "host": secret["host"],
-        "port": int(secret.get("port", 5432)),
-        "dbname": secret["dbname"],
-        "user": secret["username"],
+        "host":     secret["host"],
+        "port":     int(secret.get("port", 5432)),
+        "dbname":   secret["dbname"],
+        "user":     secret["username"],
         "password": secret["password"],
     }
 
@@ -111,24 +115,22 @@ def load_to_rds(
 ) -> int:
     """Bulk-insert inference results into PostgreSQL.
 
-    Idempotent: rows with an existing (job_name, row_index) pair are skipped
-    (ON CONFLICT DO NOTHING), so re-running the DAG for the same date is safe.
-
     Args:
-        df:             Combined inference DataFrame from s3_utils.collect_inference_results.
-        table:          Target table name (e.g. 'batch_inference_results').
-        secret_arn:     Secrets Manager ARN holding the RDS credentials.
-        region:         AWS region for both Secrets Manager and the RDS endpoint.
-        job_name:       SageMaker transform job name (stored as metadata).
-        model_name:     SageMaker model name.
+        df:             Combined inference DataFrame (from s3_utils.collect_inference_results).
+        table:          Target table name.
+        secret_arn:     Secrets Manager ARN for the RDS credentials.
+        region:         AWS region (used for both Secrets Manager and the RDS endpoint).
+        job_name:       SageMaker transform job name — stored as metadata, also used
+                        as part of the uniqueness key for idempotent inserts.
+        model_name:     Model name sourced from the Model Registry.
         model_version:  Model version string.
-        execution_date: Airflow ds macro value YYYY-MM-DD.
+        execution_date: Airflow ds macro value (YYYY-MM-DD).
 
     Returns:
-        Number of rows actually inserted (0 if all were duplicates).
+        Number of rows actually inserted (0 when all rows already exist).
     """
     conn_params = fetch_db_secret(secret_arn, region)
-    rows = _to_row_tuples(df, job_name, model_name, model_version, execution_date)
+    rows = _build_rows(df, job_name, model_name, model_version, execution_date)
 
     with _connection(conn_params) as conn:
         with conn.cursor() as cur:
@@ -138,10 +140,7 @@ def load_to_rds(
 
     logger.info(
         "RDS load complete — table: %s  job: %s  inserted: %d / %d",
-        table,
-        job_name,
-        inserted,
-        len(rows),
+        table, job_name, inserted, len(rows),
     )
     return inserted
 
@@ -151,7 +150,8 @@ def load_to_rds(
 # ---------------------------------------------------------------------------
 
 @contextmanager
-def _connection(params: dict) -> Generator:
+def _connection(params: dict):
+    """Open a psycopg2 connection, roll back on error, always close."""
     conn = psycopg2.connect(**params)
     try:
         yield conn
@@ -163,62 +163,57 @@ def _connection(params: dict) -> Generator:
 
 
 def _ensure_table(cursor, table: str) -> None:
-    """Idempotently create the target table and its indexes.
+    """Create the target table if it does not already exist.
 
-    Uses a savepoint so that a failure (e.g. insufficient CREATE privilege)
-    does not abort the surrounding transaction.  If creation fails we log a
-    warning and assume the table already exists.
+    Wraps the DDL in a savepoint because psycopg2 does not support partial
+    transaction rollbacks without one.  If CREATE TABLE fails (e.g. the pipeline
+    user lacks DDL privileges), we roll back only the savepoint, log a warning,
+    and assume the table was created by the infrastructure team.
     """
     safe = table.replace(".", "_").replace("-", "_")
-    ddl = _CREATE_TABLE_SQL.format(table=table, safe_table=safe)
     try:
         cursor.execute("SAVEPOINT ensure_table_sp")
-        cursor.execute(ddl)
+        cursor.execute(_CREATE_TABLE_SQL.format(table=table, safe_table=safe))
         cursor.execute("RELEASE SAVEPOINT ensure_table_sp")
-        logger.debug("Table '%s' ensured.", table)
     except psycopg2.Error as exc:
         cursor.execute("ROLLBACK TO SAVEPOINT ensure_table_sp")
         cursor.execute("RELEASE SAVEPOINT ensure_table_sp")
-        logger.warning(
-            "Could not create table '%s' (assuming it exists): %s", table, exc
-        )
+        logger.warning("Could not create table '%s' (assuming it exists): %s", table, exc)
 
 
 def _bulk_upsert(cursor, table: str, rows: list[tuple]) -> int:
     if not rows:
         logger.warning("No rows to insert into '%s'.", table)
         return 0
-
     psycopg2.extras.execute_values(
-        cursor,
-        _UPSERT_SQL.format(table=table),
-        rows,
-        page_size=500,
+        cursor, _UPSERT_SQL.format(table=table), rows, page_size=500,
     )
-    # rowcount after execute_values reflects actual rows inserted
+    # rowcount == -1 means the driver couldn't determine the count; fall back to len.
     return cursor.rowcount if cursor.rowcount != -1 else len(rows)
 
 
-def _to_row_tuples(
+def _build_rows(
     df: pd.DataFrame,
     job_name: str,
     model_name: str,
     model_version: str,
     execution_date: str,
 ) -> list[tuple]:
-    tuples: list[tuple] = []
-    for _, row in df.iterrows():
-        prediction = row.get("prediction")
-        tuples.append(
-            (
-                job_name,
-                model_name,
-                model_version,
-                execution_date,
-                int(row.get("row_index", 0)),
-                str(row.get("source_file", "")),
-                str(row.get("raw_output", "")),
-                float(prediction) if pd.notna(prediction) else None,
-            )
+    """Convert the inference DataFrame into a list of tuples for execute_values.
+
+    Uses itertuples (roughly 10x faster than iterrows for large DataFrames)
+    because we are reading every row sequentially to build the insert batch.
+    """
+    return [
+        (
+            job_name,
+            model_name,
+            model_version,
+            execution_date,
+            int(row.row_index),
+            str(row.source_file),
+            str(row.raw_output),
+            float(row.prediction) if pd.notna(row.prediction) else None,
         )
-    return tuples
+        for row in df.itertuples(index=False)
+    ]

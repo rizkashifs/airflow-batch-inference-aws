@@ -1,20 +1,20 @@
 """Input and output validation utilities.
 
-All validators raise ValueError (or a subclass) on failure so that the
-Airflow task is marked as FAILED with an actionable error message.
+All validators raise ValueError on failure so Airflow marks the task as FAILED
+with an actionable message rather than silently continuing with bad data.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Columns that must be present in the combined inference output DataFrame.
+# Every combined inference DataFrame must contain these columns.
+# They are produced by s3_utils.collect_inference_results().
 REQUIRED_OUTPUT_COLUMNS: frozenset[str] = frozenset(
     {"source_file", "row_index", "raw_output", "prediction"}
 )
@@ -24,21 +24,22 @@ REQUIRED_OUTPUT_COLUMNS: frozenset[str] = frozenset(
 # DAG-run conf validation
 # ---------------------------------------------------------------------------
 
-def validate_dag_conf(conf: Optional[dict]) -> dict:
-    """Validate and normalise the dag_run.conf payload.
+def validate_dag_conf(conf: dict | None) -> dict:
+    """Validate and normalise ``dag_run.conf``.
 
-    All fields are optional; their presence triggers format checks.
+    All fields are optional.  When present, each is format-checked before being
+    forwarded to downstream tasks.  Supplying an invalid value fails the run
+    immediately rather than letting a bad value propagate silently.
 
     Accepted keys:
-        execution_date_override      – YYYY-MM-DD override (default: use ds)
-        model_package_group_override – override Model Package Group name
-        instance_type_override       – override ML instance type for the job
+        execution_date_override      – YYYY-MM-DD; overrides the Airflow ``ds`` macro
+        model_package_group_override – use a different Model Registry group for this run
+        instance_type_override       – override the ML instance type (e.g. ml.m5.2xlarge)
 
-    Returns the validated subset of conf (keys that were supplied and valid).
-    Raises ValueError on any format violation.
+    Returns the validated subset of *conf*.
     """
     if not conf:
-        logger.info("No dag_run.conf supplied; using Airflow Variable defaults.")
+        logger.info("No dag_run.conf supplied — using Airflow Variable defaults.")
         return {}
 
     validated: dict = {}
@@ -47,9 +48,7 @@ def validate_dag_conf(conf: Optional[dict]) -> dict:
     exec_date = conf.get("execution_date_override")
     if exec_date is not None:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(exec_date)):
-            errors.append(
-                f"execution_date_override must be YYYY-MM-DD, got: {exec_date!r}"
-            )
+            errors.append(f"execution_date_override must be YYYY-MM-DD, got: {exec_date!r}")
         else:
             validated["execution_date_override"] = str(exec_date)
 
@@ -75,53 +74,49 @@ def validate_dag_conf(conf: Optional[dict]) -> dict:
         logger.error(msg)
         raise ValueError(msg)
 
-    logger.info("dag_run.conf validated. Effective overrides: %s", validated)
+    logger.info("dag_run.conf validated — effective overrides: %s", validated)
     return validated
 
 
 # ---------------------------------------------------------------------------
-# Output DataFrame validation
+# Inference output validation
 # ---------------------------------------------------------------------------
 
 def validate_output_dataframe(
     df: pd.DataFrame,
     min_rows: int = 1,
-    required_columns: Optional[frozenset] = None,
+    required_columns: frozenset | None = None,
     max_null_prediction_ratio: float = 0.05,
 ) -> None:
     """Validate the combined inference output DataFrame.
 
-    Checks:
-      1. At least *min_rows* rows exist.
-      2. All *required_columns* are present.
-      3. Null prediction ratio does not exceed *max_null_prediction_ratio*.
+    Runs all checks before raising so the error message lists every problem at
+    once rather than forcing repeated fix-run-fix cycles.
 
-    Raises ValueError listing all failures (not just the first).
+    Checks:
+        1. Row count is at least *min_rows*.
+        2. All *required_columns* are present.
+        3. Null ``prediction`` ratio does not exceed *max_null_prediction_ratio*.
     """
     if required_columns is None:
         required_columns = REQUIRED_OUTPUT_COLUMNS
 
     errors: list[str] = []
 
-    # 1 – row count
     if len(df) < min_rows:
-        errors.append(
-            f"Row count {len(df)} is below the minimum of {min_rows}."
-        )
+        errors.append(f"Row count {len(df)} is below minimum {min_rows}.")
 
-    # 2 – required columns
     missing = required_columns - set(df.columns)
     if missing:
         errors.append(f"Missing required columns: {sorted(missing)}.")
 
-    # 3 – null predictions
     if "prediction" in df.columns:
-        null_count: int = int(df["prediction"].isna().sum())
-        null_ratio: float = null_count / max(len(df), 1)
+        null_count = int(df["prediction"].isna().sum())
+        null_ratio = null_count / max(len(df), 1)
         if null_ratio > max_null_prediction_ratio:
             errors.append(
                 f"Null prediction ratio {null_ratio:.1%} ({null_count}/{len(df)} rows) "
-                f"exceeds the allowed threshold of {max_null_prediction_ratio:.1%}."
+                f"exceeds threshold of {max_null_prediction_ratio:.1%}."
             )
 
     if errors:
