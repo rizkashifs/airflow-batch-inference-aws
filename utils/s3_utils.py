@@ -60,7 +60,12 @@ def validate_input_data(bucket: str, prefix: str) -> dict:
     ``list_objects_v2`` avoids an extra ``head_object`` per file.
     Raises RuntimeError if no files are found or any file is empty.
 
-    Returns ``{"file_count": N}`` for use in log_status.
+    Returns:
+        dict: ``{"file_count": N}`` for use in log_status.
+
+    GUIDE: WHY CHECK FOR EMPTY FILES?
+    SageMaker Batch Transform can silently "succeed" even if input files are empty,
+    producing 0 output rows. This often hides upstream data pipeline failures.
     """
     s3 = boto3.client("s3")
     paginator = s3.get_paginator("list_objects_v2")
@@ -108,6 +113,11 @@ def collect_inference_results(bucket: str, output_prefix: str) -> pd.DataFrame:
         row_index    – 0-based position across all files (sorted by key name)
         raw_output   – raw text line exactly as SageMaker wrote it
         prediction   – first CSV field cast to float (None when unparseable)
+
+    GUIDE: HOW SAGEMAKER WRITES DATA
+    SageMaker splits predictions into multiple files (e.g., input.csv.out, input_2.csv.out).
+       By sorting the S3 keys in list_output_files(), we ensure that even if the 
+       files are downloaded in a different order, they are merged predictably.
     """
     keys = list_output_files(bucket, output_prefix)
     if not keys:

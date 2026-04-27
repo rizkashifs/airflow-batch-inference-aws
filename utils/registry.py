@@ -110,6 +110,10 @@ def _resolve_model_name(description: dict, fallback: str) -> str:
     under the key 'sagemaker_model_name' or 'model_name'.
     If absent, falls back to the model package group name (common when a
     single Model is shared across package versions).
+
+    GUIDE: WHERE IS THE MODEL NAME?
+    A "Model Package" in the registry just points to code/data. To run inference,
+    we need an actual SageMaker "Model" resource.
     """
     props = description.get("CustomerMetadataProperties") or {}
     for key in ("sagemaker_model_name", "model_name", "ModelName"):
@@ -127,6 +131,10 @@ def _resolve_instance_type(description: dict, default: str) -> str:
       1. ml.m5 family (cost-effective for tabular/CSV workloads)
       2. First entry in SupportedTransformInstanceTypes
       3. *default* argument
+
+    GUIDE: WHY ml.m5?
+    We prioritize the ml.m5 family because it offers the best performance-to-cost
+    ratio for CPU-bound batch inference tasks (like CSV/tabular processing).
     """
     spec = description.get("InferenceSpecification") or {}
     types: list[str] = spec.get("SupportedTransformInstanceTypes") or []

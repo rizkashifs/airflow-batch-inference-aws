@@ -66,8 +66,21 @@ def _make_job_name(dag_id: str, ts_nodash: str) -> str:
 
     Format: ``{dag_id}-transform-{ts_nodash}`` (lowercase, hyphens only).
     SageMaker allows [a-z0-9-], max 63 chars, no leading/trailing hyphen.
+    
+    GUIDE: WHY THIS LOGIC?
+    1. SageMaker allows [a-z0-9-] only. No underscores or uppercase.
+    2. Max length is 63 chars. Exceeding this causes API failure immediately.
+    3. We add 'ts_nodash' to ensure the name is unique even if the DAG is 
+       re-triggered multiple times on the same calendar day.
     """
+    # 1. Replace underscores (common in DAG IDs) with hyphens
     raw = f"{dag_id.replace('_', '-')}-transform-{ts_nodash}".lower()
+    
+    # 2. Sanitize: Drop characters that aren't a-z, 0-9, or hyphen
     sanitized = _INVALID_CHARS.sub("-", raw)
+    
+    # 3. Clean up: Avoid double hyphens '--' and trailing hyphens
     sanitized = _MULTI_HYPHEN.sub("-", sanitized).strip("-")
+    
+    # 4. Enforce: Trim to SageMaker's hard limit of 63 characters
     return sanitized[:_MAX_JOB_NAME_LEN]

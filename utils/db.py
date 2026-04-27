@@ -169,6 +169,10 @@ def _ensure_table(cursor, table: str) -> None:
     transaction rollbacks without one.  If CREATE TABLE fails (e.g. the pipeline
     user lacks DDL privileges), we roll back only the savepoint, log a warning,
     and assume the table was created by the infrastructure team.
+
+    GUIDE: WHY THE SAVEPOINT?
+    Postgres treats any failed command (like a CREATE TABLE that errors on
+    permissions) as a "dead" transaction that must be rolled back entirely.
     """
     safe = table.replace(".", "_").replace("-", "_")
     try:
@@ -203,6 +207,11 @@ def _build_rows(
 
     Uses itertuples (roughly 10x faster than iterrows for large DataFrames)
     because we are reading every row sequentially to build the insert batch.
+
+    GUIDE: WHY ITERTUPLES?
+    We use itertuples() because it is significantly faster (roughly 10x) than
+    iterrows(). For bulk loads of 100k+ rows, iterrows() can stall the Airflow
+    worker for minutes.
     """
     return [
         (
