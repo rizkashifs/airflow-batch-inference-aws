@@ -48,7 +48,8 @@ INSERT INTO {table}
     (job_name, model_name, model_version, execution_date,
      row_index, source_file, raw_output, prediction)
 VALUES %s
-ON CONFLICT (job_name, row_index) DO NOTHING;
+ON CONFLICT (job_name, row_index) DO NOTHING
+RETURNING 1
 """
 
 
@@ -167,8 +168,8 @@ def _ensure_table(cursor, table: str) -> None:
 
     Wraps the DDL in a savepoint because psycopg2 does not support partial
     transaction rollbacks without one.  If CREATE TABLE fails (e.g. the pipeline
-    user lacks DDL privileges), we roll back only the savepoint, log a warning,
-    and assume the table was created by the infrastructure team.
+    user lacks DDL privileges), we verify the table actually exists before
+    continuing — raising a clear RuntimeError if it does not.
 
     GUIDE: WHY THE SAVEPOINT?
     Postgres treats any failed command (like a CREATE TABLE that errors on
@@ -182,18 +183,27 @@ def _ensure_table(cursor, table: str) -> None:
     except psycopg2.Error as exc:
         cursor.execute("ROLLBACK TO SAVEPOINT ensure_table_sp")
         cursor.execute("RELEASE SAVEPOINT ensure_table_sp")
-        logger.warning("Could not create table '%s' (assuming it exists): %s", table, exc)
+        # Confirm the table exists before continuing; to_regclass returns NULL when absent.
+        cursor.execute("SELECT to_regclass(%s)", (table,))
+        if cursor.fetchone()[0] is None:
+            raise RuntimeError(
+                f"Table '{table}' does not exist and could not be created: {exc}. "
+                "Pre-create it via IaC or grant CREATE TABLE to the pipeline user."
+            ) from exc
+        logger.info("Table '%s' already exists — DDL skipped.", table)
 
 
 def _bulk_upsert(cursor, table: str, rows: list[tuple]) -> int:
     if not rows:
         logger.warning("No rows to insert into '%s'.", table)
         return 0
-    psycopg2.extras.execute_values(
-        cursor, _UPSERT_SQL.format(table=table), rows, page_size=500,
+    # fetch=True + RETURNING 1: each actually-inserted row returns one record.
+    # Rows skipped by ON CONFLICT DO NOTHING are absent from the result, giving
+    # an accurate count even when execute_values pages across multiple batches.
+    result = psycopg2.extras.execute_values(
+        cursor, _UPSERT_SQL.format(table=table), rows, page_size=500, fetch=True,
     )
-    # rowcount == -1 means the driver couldn't determine the count; fall back to len.
-    return cursor.rowcount if cursor.rowcount != -1 else len(rows)
+    return len(result)
 
 
 def _build_rows(
