@@ -5,9 +5,28 @@ resolves the latest approved model from SageMaker Model Registry, runs a
 SageMaker Batch Transform job, validates the output, and loads results into
 PostgreSQL RDS.
 
+> **Deployment target:** AWS MWAA 2.8.x (Airflow 2.8, Python 3.11).
+> The DAG imports Airflow and Amazon provider classes that are only available
+> inside an MWAA environment; it cannot be executed locally.
+> See [Local development](#local-development) for running the unit tests locally.
+
 ---
 
-## What it does (pipeline overview)
+## Table of contents
+
+1. [Pipeline overview](#pipeline-overview)
+2. [Repository structure](#repository-structure)
+3. [Infrastructure requirements](#infrastructure-requirements)
+4. [Deployment](#deployment)
+5. [Airflow Variables](#airflow-variables)
+6. [First-run checklist](#first-run-checklist)
+7. [Running the DAG](#running-the-dag)
+8. [Database schema](#database-schema)
+9. [Local development](#local-development)
+
+---
+
+## Pipeline overview
 
 ```
 validate_input
@@ -29,7 +48,7 @@ validate_input
 | **load_model_from_registry** | Calls `list_model_packages` + `describe_model_package` to find the latest `Approved` model; extracts model name, version, and instance type — **never creates a model** |
 | **build_transform_config** | Builds the job config (name, S3 paths, compute) and pushes every field to XCom so downstream tasks can reference them |
 | **run_batch_transform** | Submits a SageMaker Batch Transform job, polls every 30 s, waits up to 6 hours |
-| **wait_for_inference_output** | S3KeySensor confirms `.csv.out` files are visible in S3 before proceeding (safety gate after the transform) |
+| **wait_for_inference_output** | S3KeySensor confirms `.csv.out` files are visible in S3 before proceeding |
 | **postprocess_output** | Reads all `.csv.out` files, combines them into a single DataFrame, and stages it to `s3://<bucket>/batch/processed/<date>/combined.csv` |
 | **validate_output** | Checks row count > 0, required columns exist, and null-prediction ratio ≤ 5% |
 | **load_to_rds** | Bulk-inserts results into PostgreSQL using `ON CONFLICT DO NOTHING` — safe to re-run |
@@ -43,7 +62,6 @@ validate_input
 .
 ├── dags/
 │   └── ml_inference_pipeline.py   # Airflow DAG — thin orchestrator only
-│                                  # All business logic lives in utils/
 └── utils/
     ├── __init__.py
     ├── registry.py      # Queries SageMaker Model Registry
@@ -53,61 +71,27 @@ validate_input
     └── db.py            # Loads results into PostgreSQL via psycopg2
 ```
 
-### File descriptions
-
-**`dags/ml_inference_pipeline.py`**
-The only file Airflow directly parses.  Defines the DAG, all task operators,
-and thin callable functions that delegate to `utils/`.  Does not contain any
-AWS or database logic.
-
-**`utils/registry.py`**
-`get_latest_approved_model(group, region)` — pages through
-`list_model_packages` (sorted by CreationTime DESC, filtered to `Approved`),
-calls `describe_model_package` on the newest one, and returns a plain dict
-with `model_name`, `model_version`, `instance_type`, and `model_package_arn`.
-The model name is read from `CustomerMetadataProperties` (key
-`sagemaker_model_name` or `model_name`), falling back to the group name.
-
-**`utils/sagemaker.py`**
-`build_transform_config(model_info, bucket, execution_date, dag_id, ts_nodash)`
-— assembles the flat config dict for a single run.  All S3 paths are
-date-partitioned (`batch/input/<date>/`, `batch/output/<date>/`).  The job name
-is built as `<dag_id>-transform-<ts_nodash>` (lowercase, hyphens only, max 63
-chars) so it is unique per trigger even when re-running the same date.
-
-**`utils/s3_utils.py`**
-Four public functions:
-- `validate_input_data(bucket, prefix)` — verifies CSV files exist and are non-empty
-- `collect_inference_results(bucket, prefix)` — reads all `.csv.out` files and
-  returns a combined DataFrame (`source_file`, `row_index`, `raw_output`, `prediction`)
-- `write_dataframe_to_s3(df, bucket, key)` — uploads a DataFrame as CSV; returns the S3 URI
-- `read_dataframe_from_s3(uri)` — reads a CSV from an `s3://` URI into a DataFrame
-
-**`utils/validation.py`**
-- `validate_dag_conf(conf)` — format-checks optional overrides in `dag_run.conf`
-- `validate_output_dataframe(df)` — checks row count, required columns, and null-prediction ratio;
-  collects all errors before raising so every problem is reported at once
-
-**`utils/db.py`**
-- `fetch_db_secret(arn, region)` — retrieves credentials from AWS Secrets Manager
-- `load_to_rds(df, table, ...)` — bulk-inserts via `execute_values` with
-  `ON CONFLICT (job_name, row_index) DO NOTHING` for idempotency;
-  creates the target table if it does not exist (using a savepoint so a
-  privilege failure does not abort the transaction)
+`utils/` contains all business logic; `dags/ml_inference_pipeline.py` is a thin
+orchestrator that wires the tasks together and delegates to `utils/`.
 
 ---
 
-## Prerequisites
+## Infrastructure requirements
 
-| Requirement | Notes |
-|-------------|-------|
-| AWS MWAA 2.8.x | Airflow 2.8, Python 3.11 |
-| SageMaker Model Registry | At least one `Approved` model package in the configured group |
-| S3 bucket | Input CSVs placed at `batch/input/<YYYY-MM-DD>/` before the DAG runs |
-| RDS PostgreSQL | Accessible from MWAA VPC; credentials stored in Secrets Manager |
-| MWAA execution role | Needs permissions for SageMaker, S3, Secrets Manager (see below) |
+All of the following must exist before the DAG can run.
 
-### Minimum IAM permissions for the MWAA execution role
+### AWS services
+
+| Service | What is needed |
+|---------|---------------|
+| **AWS MWAA 2.8.x** | The execution environment. No other Airflow deployment is supported. |
+| **S3 bucket** | One bucket for both input data and output. The pipeline user needs `s3:GetObject`, `s3:PutObject`, and `s3:ListBucket` on the bucket. |
+| **SageMaker Model Registry** | A Model Package Group containing at least one `Approved` versioned model package. The approved package must store the deployed SageMaker Model name in `CustomerMetadataProperties` under the key `sagemaker_model_name` or `model_name` (see [Model name convention](#model-name-convention) below). |
+| **SageMaker Model resource** | A pre-existing SageMaker Model (not created by this pipeline) whose name matches what is stored in the registry metadata above. |
+| **AWS Secrets Manager** | A secret containing the RDS credentials in the JSON format described in [Secrets Manager secret format](#secrets-manager-secret-format). |
+| **RDS PostgreSQL** | A PostgreSQL instance reachable from the MWAA VPC. The pipeline user needs `INSERT` and `SELECT` on the target table. If the user also has `CREATE TABLE`, the table is bootstrapped automatically on first run; otherwise pre-create it with the DDL in [Database schema](#database-schema). |
+
+### IAM permissions for the MWAA execution role
 
 ```json
 {
@@ -126,23 +110,62 @@ Four public functions:
 }
 ```
 
+Scope `Resource` to specific ARNs in production.
+
+### Model name convention
+
+The pipeline resolves the SageMaker Model name from the model package's
+`CustomerMetadataProperties`. Set one of these keys when registering a model
+package version:
+
+```python
+customer_metadata_properties = {
+    "sagemaker_model_name": "my-deployed-model-name"
+    # or: "model_name": "my-deployed-model-name"
+}
+```
+
+If neither key is present, the Model Package Group name is used as the model
+name (works when a single Model resource is shared across all package versions).
+
+### Secrets Manager secret format
+
+The secret pointed to by `ml_pipeline_db_secret_arn` must be a JSON string with
+these exact keys:
+
+```json
+{
+  "host":     "my-rds-instance.xxxx.ca-central-1.rds.amazonaws.com",
+  "port":     5432,
+  "dbname":   "mlops",
+  "username": "pipeline_user",
+  "password": "s3cr3t"
+}
+```
+
+`port` is optional and defaults to `5432`.
+
 ---
 
-## Setup steps
+## Deployment
 
-### 1. Install the extra dependency
+### 1. Upload `requirements.txt`
 
-Upload `requirements.txt` to the MWAA S3 bucket and point the environment at it.
-The only non-bundled package is `psycopg2-binary`.
+Upload `requirements.txt` to the MWAA S3 bucket and configure the MWAA
+environment to use it. The only package it installs is `psycopg2-binary`
+(all other dependencies are pre-installed by MWAA 2.8.x).
 
+```bash
+aws s3 cp requirements.txt s3://<mwaa-bucket>/requirements.txt
 ```
-s3://<mwaa-bucket>/requirements.txt
-```
 
-### 2. Deploy the DAG and utils
+Then update the MWAA environment to point at the new requirements file and
+wait for the environment to finish updating before deploying the DAG.
 
-MWAA adds everything inside `dags/` to `sys.path`, so `utils/` must live
-**inside** the `dags/` S3 prefix:
+### 2. Deploy `dags/` and `utils/`
+
+MWAA adds everything under the `dags/` S3 prefix to `sys.path` automatically,
+so `utils/` **must be placed inside `dags/`** — not at the bucket root.
 
 ```
 s3://<mwaa-bucket>/dags/ml_inference_pipeline.py
@@ -157,60 +180,97 @@ s3://<mwaa-bucket>/dags/utils/db.py
 Sync command:
 
 ```bash
-aws s3 sync dags/         s3://<mwaa-bucket>/dags/
-aws s3 sync utils/        s3://<mwaa-bucket>/dags/utils/
-aws s3 cp requirements.txt s3://<mwaa-bucket>/requirements.txt
+aws s3 sync dags/  s3://<mwaa-bucket>/dags/
+aws s3 sync utils/ s3://<mwaa-bucket>/dags/utils/
 ```
 
 ### 3. Set Airflow Variables
 
-In the MWAA UI go to **Admin → Variables** and add:
+See the full table in [Airflow Variables](#airflow-variables).
 
-| Key | Example value | Required |
-|-----|---------------|----------|
-| `ml_pipeline_s3_bucket` | `my-mlops-bucket` | Yes |
-| `ml_pipeline_model_package_group` | `my-model-group` | Yes |
-| `ml_pipeline_db_secret_arn` | `arn:aws:secretsmanager:ca-central-1:123:secret:rds-creds` | Yes |
-| `ml_pipeline_aws_region` | `ca-central-1` | No (default: `ca-central-1`) |
-| `ml_pipeline_db_table` | `batch_inference_results` | No (default: `batch_inference_results`) |
-| `ml_pipeline_default_instance_type` | `ml.m5.xlarge` | No (default: `ml.m5.xlarge`) |
+### 4. Place input data
 
-### 4. Confirm the Secrets Manager secret format
-
-The secret pointed to by `ml_pipeline_db_secret_arn` must be a JSON string:
-
-```json
-{
-  "host":     "my-rds-instance.xxxx.ca-central-1.rds.amazonaws.com",
-  "port":     5432,
-  "dbname":   "mlops",
-  "username": "pipeline_user",
-  "password": "…"
-}
-```
-
-### 5. Place input data
-
-Upload your input CSV files to S3 before the scheduled run time:
+Upload input CSV files to S3 before the scheduled run or manual trigger:
 
 ```
 s3://<bucket>/batch/input/2024-01-15/features.csv
 ```
 
-The DAG reads whatever files are under that prefix, so multiple files are fine.
+Multiple CSV files under the same prefix are supported.
+
+---
+
+## Airflow Variables
+
+Set these in the MWAA UI under **Admin → Variables**.
+
+### Required
+
+| Variable | Example value | Description |
+|----------|---------------|-------------|
+| `ml_pipeline_s3_bucket` | `my-mlops-bucket` | S3 bucket name — no `s3://` prefix |
+| `ml_pipeline_model_package_group` | `my-model-group` | SageMaker Model Package Group name |
+| `ml_pipeline_db_secret_arn` | `arn:aws:secretsmanager:ca-central-1:123:secret:rds-creds-abc123` | Full ARN of the Secrets Manager secret |
+
+### Optional (have sensible defaults)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ml_pipeline_aws_region` | `ca-central-1` | AWS region for SageMaker, S3, and Secrets Manager |
+| `ml_pipeline_db_table` | `batch_inference_results` | Target PostgreSQL table name |
+| `ml_pipeline_default_instance_type` | `ml.m5.xlarge` | Fallback instance type when the registry provides no preference |
+
+---
+
+## First-run checklist
+
+Work through this list top-to-bottom before triggering the DAG for the first
+time.
+
+```
+Infrastructure
+  [ ] MWAA environment is on version 2.8.x
+  [ ] MWAA execution role has the IAM permissions listed above
+  [ ] S3 bucket exists and is accessible from MWAA
+  [ ] SageMaker Model Package Group has at least one Approved package
+  [ ] Approved package has sagemaker_model_name / model_name in CustomerMetadataProperties
+  [ ] A SageMaker Model resource exists with that name
+  [ ] RDS PostgreSQL is reachable from the MWAA VPC
+  [ ] Secrets Manager secret is in the required JSON format
+  [ ] Pipeline DB user has INSERT + SELECT on the target table
+      (or CREATE TABLE if relying on the bootstrap path)
+
+Deployment
+  [ ] requirements.txt uploaded and MWAA environment updated (wait for "Available")
+  [ ] utils/ synced to s3://<mwaa-bucket>/dags/utils/
+  [ ] ml_inference_pipeline.py synced to s3://<mwaa-bucket>/dags/
+  [ ] DAG appears in the MWAA UI without import errors
+
+Configuration
+  [ ] ml_pipeline_s3_bucket Variable set
+  [ ] ml_pipeline_model_package_group Variable set
+  [ ] ml_pipeline_db_secret_arn Variable set
+
+Data
+  [ ] Input CSV files uploaded to s3://<bucket>/batch/input/<YYYY-MM-DD>/
+```
 
 ---
 
 ## Running the DAG
 
 ### Scheduled run
+
 The DAG runs daily at **23:00 Toronto time** (`0 23 * * *`).
 
-### Manual trigger (standard)
-In the MWAA UI, click **Trigger DAG** with no config.
+### Manual trigger (no overrides)
+
+In the MWAA UI click **Trigger DAG** with no config. The pipeline uses the
+current Airflow execution date and the default Variables.
 
 ### Manual trigger with overrides
-Trigger with a JSON conf body to override defaults for a single run:
+
+Provide a JSON body when triggering to override defaults for a single run:
 
 ```json
 {
@@ -220,53 +280,85 @@ Trigger with a JSON conf body to override defaults for a single run:
 }
 ```
 
-All three keys are optional and independently validated.
+All three keys are optional and independently validated. An invalid value
+(wrong date format, blank group name, unrecognised instance type pattern)
+fails the `validate_input` task immediately with an actionable error message.
 
 ---
 
 ## Database schema
 
-The table is created automatically on first run if it does not exist.
+The table is created automatically on the first successful run if the pipeline
+user has `CREATE TABLE` privileges. For production deployments, pre-create it
+via IaC and grant only `INSERT` and `SELECT` to the pipeline user.
 
 ```sql
 CREATE TABLE batch_inference_results (
     id              BIGSERIAL        PRIMARY KEY,
-    job_name        VARCHAR(63)      NOT NULL,   -- SageMaker transform job name
+    job_name        VARCHAR(63)      NOT NULL,
     model_name      VARCHAR(255)     NOT NULL,
     model_version   VARCHAR(63),
     execution_date  DATE             NOT NULL,
-    row_index       INTEGER          NOT NULL,   -- 0-based, unique per job
-    source_file     TEXT,                        -- S3 key of the .csv.out file
-    raw_output      TEXT,                        -- raw prediction line
-    prediction      DOUBLE PRECISION,            -- first CSV field cast to float
+    row_index       INTEGER          NOT NULL,
+    source_file     TEXT,
+    raw_output      TEXT,
+    prediction      DOUBLE PRECISION,
     loaded_at       TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
-    UNIQUE (job_name, row_index)
+    CONSTRAINT uq_batch_inference_results_job_row UNIQUE (job_name, row_index)
 );
+CREATE INDEX IF NOT EXISTS idx_batch_inference_results_job       ON batch_inference_results (job_name);
+CREATE INDEX IF NOT EXISTS idx_batch_inference_results_exec_date ON batch_inference_results (execution_date);
 ```
 
-Re-running the DAG for the same date produces the same `job_name` only if using
-the same trigger timestamp.  Because `action_if_job_exists="timestamp"` appends
-a suffix to duplicate job names in SageMaker, a re-run always creates a new job
-and inserts its output as new rows.
+Inserts are idempotent: re-triggering a run for the same `job_name` skips rows
+that already exist (`ON CONFLICT DO NOTHING`). Each trigger of the DAG produces
+a new `job_name` (based on the trigger timestamp), so re-runs on the same date
+insert new rows rather than updating existing ones.
 
 ---
 
 ## Local development
 
+The DAG file itself cannot run locally — it imports Airflow and Amazon provider
+classes only available inside MWAA. However, the utility modules (`utils/`) have
+no Airflow dependency and can be developed and tested locally.
+
+### Running the unit tests
+
 ```bash
-# 1 – install dependencies
-pip install apache-airflow apache-airflow-providers-amazon psycopg2-binary pandas boto3
+# Install test dependencies (does not require Airflow or AWS credentials)
+pip install -r requirements-dev.txt
 
-# 2 – set PYTHONPATH so utils/ is importable from dags/
-export PYTHONPATH=$(pwd):$PYTHONPATH
-export AIRFLOW_HOME=$(pwd)
+# Run all tests
+python -m pytest tests/ -v
 
-# 3 – initialise the Airflow metadata DB (SQLite, for local use only)
-airflow db init
+# Run with coverage report
+python -m pytest tests/ --cov=utils --cov-report=term-missing
+```
 
-# 4 – parse the DAG (no task execution)
-python dags/ml_inference_pipeline.py
+The tests use `unittest.mock` to stub all AWS calls — no real AWS credentials
+or infrastructure are needed.
 
-# 5 – run a single task locally (requires real AWS credentials)
-airflow tasks test ml_inference_pipeline validate_input 2024-01-15
+### Checking DAG syntax without MWAA
+
+To verify the DAG file parses without syntax errors (imports will fail without
+Airflow installed, but the AST check is sufficient):
+
+```bash
+python -c "import ast; ast.parse(open('dags/ml_inference_pipeline.py').read()); print('OK')"
+```
+
+### Testing utils against real AWS (optional)
+
+If you have valid AWS credentials and want to exercise the utils against a real
+account, set the relevant environment variables:
+
+```bash
+export AWS_DEFAULT_REGION=ca-central-1
+export AWS_PROFILE=your-profile   # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+
+python -c "
+from utils.s3_utils import validate_input_data
+print(validate_input_data('your-bucket', 'batch/input/2024-01-15/'))
+"
 ```

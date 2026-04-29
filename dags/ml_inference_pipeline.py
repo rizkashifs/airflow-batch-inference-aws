@@ -328,7 +328,7 @@ _DEFAULT_ARGS = {
 with DAG(
     dag_id="ml_inference_pipeline",
     description="End-to-end ML batch inference: Model Registry → SageMaker Transform → RDS",
-    schedule_interval="0 23 * * *",   # daily at 23:00 Toronto time
+    schedule="0 23 * * *",             # daily at 23:00 Toronto time
     start_date=datetime(2024, 1, 1, tzinfo=pendulum.timezone("America/Toronto")),
     catchup=False,
     max_active_runs=1,
